@@ -12,7 +12,7 @@
   - `POST /api/v1/seal`：印章视觉证据
   - `GET /api/v1/health`：连通性检查
 
-默认本服务端口 `8090`，本地运行只监听 `127.0.0.1`；配置模板中的 OCR 网关指向 `http://172.20.1.147:8080`，不同环境请在 `.env` 里覆盖。Docker Compose 会把服务监听地址显式设为 `0.0.0.0`，以便容器端口映射。
+默认本服务端口 `8090`，本地运行只监听 `127.0.0.1`；配置模板中的 OCR 网关指向 `http://127.0.0.1:8080`，不同环境请在 `.env` 里覆盖。Docker Compose 会把服务监听地址显式设为 `0.0.0.0`，以便容器端口映射。
 除健康检查外的合同审查、预览、对比、规则和任务 API 都需要 `X-API-Token`（或 `AUTH_HEADER_NAME` 配置的请求头）。审查控制台右上角可以填写 Token，Token 只保存在当前浏览器会话中；若 OCR 网关开启了鉴权，把 `OCR_GATEWAY_TOKEN` 写在本服务 `.env` 即可，由后端代填。
 
 ## 配置（必做）
@@ -117,7 +117,7 @@ uv run python scripts/evaluate_expert_contract_cases.py
 `CONTRACT_REVIEW_LIVE_REDIS_URL` 后运行下面的并发回归，验证幂等键、原子准入和阶段事件账本：
 
 ```powershell
-$env:CONTRACT_REVIEW_LIVE_REDIS_URL = 'redis://172.20.1.147:6380/2'
+$env:CONTRACT_REVIEW_LIVE_REDIS_URL = 'redis://localhost:6380/2'
 uv run --no-sync pytest -q tests/integration/test_redis_task_store_live.py
 ```
 

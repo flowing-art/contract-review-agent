@@ -497,6 +497,47 @@ def confirm_candidate(rule_id: str) -> Rule:
         return candidate
 
 
+def confirm_candidates(rule_ids: Sequence[str] | None = None) -> list[Rule]:
+    """批量确认启用 AI 候选规则：``rule_ids`` 为空时启用全部待确认候选。
+
+    与单条 ``confirm_candidate`` 同一语义（转入「合同检查标准」并立即生效），
+    只是把 N 次写盘合并成一次。指定 ``rule_ids`` 时任一 id 不在候选池即报错，
+    避免"部分成功"造成的状态歧义。
+    """
+
+    overlay = load_overlay()
+    if rule_ids:
+        wanted = {str(item).strip() for item in rule_ids}
+        wanted.discard("")
+        available = {item.rule_id for item in overlay.ai_candidates}
+        missing = sorted(wanted - available)
+        if missing:
+            raise RuleEditError(
+                "AI 候选规则不存在: " + ", ".join(missing)
+            )
+        targets = [item for item in overlay.ai_candidates if item.rule_id in wanted]
+    else:
+        targets = list(overlay.ai_candidates)
+    if not targets:
+        return []
+    confirmed_ids = {item.rule_id for item in targets}
+    overlay.ai_candidates = [
+        item for item in overlay.ai_candidates if item.rule_id not in confirmed_ids
+    ]
+    overlay.custom_rules = [
+        item for item in overlay.custom_rules if item.rule_id not in confirmed_ids
+    ]
+    overlay.custom_rules.extend(targets)
+    overlay.disabled_ids = [
+        item for item in overlay.disabled_ids if item not in confirmed_ids
+    ]
+    overlay.removed_ids = [
+        item for item in overlay.removed_ids if item not in confirmed_ids
+    ]
+    _write_overlay(overlay)
+    return targets
+
+
 RULE_TOPICS: list[str] = [
     "合同类型",
     "金额",

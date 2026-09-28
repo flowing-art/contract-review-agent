@@ -36,6 +36,20 @@ class RuleWriteResponse(BaseModel):
     rule_id: str
 
 
+class RuleBatchConfirmRequest(BaseModel):
+    """批量确认 AI 候选规则：``rule_ids`` 省略或为空时确认全部待确认候选。"""
+
+    rule_ids: list[str] | None = None
+
+
+class RuleBatchConfirmResponse(BaseModel):
+    """批量确认结果摘要（一次写盘，全部转入合同检查标准）。"""
+
+    status: str
+    confirmed: list[str] = Field(default_factory=list)
+    count: int = 0
+
+
 class RulesEngineViewResponse(BaseModel):
     """v1 ``/ai-rules`` 同构的规则引擎库视图。
 

@@ -32,6 +32,8 @@ from contract_review_app.models import (
     ContractElementFieldDefinitionResponse,
     ContractElementFieldWriteRequest,
     RiskPanelsResponse,
+    RuleBatchConfirmRequest,
+    RuleBatchConfirmResponse,
     RuleWriteRequest,
     RuleWriteResponse,
     RulesEngineViewResponse,
@@ -640,6 +642,33 @@ async def add_contract_rule(
             400, "InvalidParameterValue.InvalidParameterValueLimit", str(exc)
         ) from exc
     return RuleWriteResponse(status="created", rule_id=rule.rule_id)
+
+
+@router.post(
+    "/contract-review/rules/confirm-candidates",
+    response_model=RuleBatchConfirmResponse,
+    summary="批量确认 AI 候选规则（全部或指定 id，一次写盘即生效）",
+)
+async def confirm_contract_rule_candidates(
+    payload: RuleBatchConfirmRequest | None = None,
+    _: bool = Depends(verify_api_token),
+):
+    """把 AI 自进化候选池里的规则批量转入「合同检查标准」并立即生效。
+
+    必须注册在 ``/rules/{rule_id}`` 参数路由之前，否则
+    ``confirm-candidates`` 会被当作 rule_id 吃掉。
+    """
+
+    requested = payload.rule_ids if payload is not None else None
+    try:
+        confirmed = await asyncio.to_thread(rule_edits.confirm_candidates, requested)
+    except RuleEditError as exc:
+        raise AppError(404, "ResourceNotFound.RuleNotFound", str(exc)) from exc
+    return RuleBatchConfirmResponse(
+        status="confirmed",
+        confirmed=[rule.rule_id for rule in confirmed],
+        count=len(confirmed),
+    )
 
 
 @router.put(

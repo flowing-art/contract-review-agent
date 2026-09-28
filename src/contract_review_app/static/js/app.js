@@ -460,7 +460,7 @@ function mergeFiles(current, incoming) {
  * AI 侧只贡献判定结论（等级/理由/原文），规则身份（编号、分类、条文位置）
  * 仍取自规则包。AI 在规则之外额外发现的风险点（无 rule_id）追加在末尾。
  */
-function reviewItems(resp) {
+function reviewItemsSplit(resp) {
   const rr = resp?.review_result;
   // 全量 findings（含 PASS/不适用）参与投影——内控栏的符合/不符/待确认
   // 分栏需要完整规则清单。
@@ -472,9 +472,13 @@ function reviewItems(resp) {
     source: "ai",
     module: item.module || "风险点",
     quote: item.quote || null,
+    // 卡片与"插入评论"都读 suggested_action：AI 补充项的模型建议喂到这里。
+    suggested_action: item.recommended_action || null,
     verdict: itemVerdict(item),
   }));
-  if (!aiItems.length) return sortBySeverity(ruleItems);
+  if (!aiItems.length) {
+    return { ruleItems, aiExtras: [], items: sortBySeverity(ruleItems) };
+  }
 
   // rule_id 优先；个别条目没回填 rule_id 时退化为标题逐字匹配（兼容历史存档）。
   // 标题索引建在规则侧：规则侧每条都有 rule_id，AI 侧才可能缺，只有把标题
@@ -491,6 +495,9 @@ function reviewItems(resp) {
     return mapped ? `id:${mapped}` : `title:${title}`;
   };
 
+  // 规则身份取自规则包：合并时要读 check_method（关键字规则的原文校验用）。
+  const rulesById = new Map((rr?.rule_bundle?.rules || []).map((rule) => [rule.rule_id, rule]));
+
   const pending = new Map();
   aiItems.forEach((item) => {
     const key = matchKey(item);
@@ -501,9 +508,43 @@ function reviewItems(resp) {
   const merged = ruleItems.map((base) => {
     const hits = pending.get(`id:${base.rule_id}`);
     if (!hits || !hits.length) return base;
+    // 附件缺失是确定性证据结论（checker attachment_completeness 核对合同包文件
+    // 得出，引擎层同样用 preserved_rule_ids 保护它不被语义判定替换）。AI 通读
+    // 判定不得覆盖：实测模型会把"合同包缺少引用附件"改写成"未见附件效力约定"
+    // （错——合同里明明写了附件有同等效力），并把正确的补充附件建议一起带走。
+    // 这里消费掉 AI 条目，避免它再以"规则外补充"的身份重复出现。
+    if (base.uncertainty_reason === "required_attachment_missing") {
+      pending.delete(`id:${base.rule_id}`);
+      return base;
+    }
     const ai = hits.shift();
     if (!hits.length) pending.delete(`id:${base.rule_id}`);
+    const rule = rulesById.get(base.rule_id);
     const level = ai.risk_level || base.risk_level;
+    // 建议的出处优先级：AI 判定建议 → 规则自身建议 → 原 finding 建议。
+    // 基线阶段模型判定规则的 finding 是占位 UNKNOWN（"未发现…表述"），它的
+    // recommended_action 是"缺信息"口径的通用文案；AI 判定一旦覆盖等级，
+    // 再沿用那份建议会出现"理由说 A、建议说 B"的自相矛盾，故直接作废。
+    // 注意这里必须整体加括号：`a || b ? c : d` 在 JS 里等价于
+    // `(a || b) ? c : d`，漏括号会让三元把整个 `||` 当作条件——AI 给了建议时
+    // 反而回退到规则侧建议，把上面这条优先级整个颠倒过来。
+    const baseSuggestionStale = Boolean(base.uncertainty_reason);
+    const suggestion = ai.recommended_action
+      || (base.suggested_action && !baseSuggestionStale ? base.suggested_action : null);
+    const aiQuote = String(ai.quote || "").trim();
+    // 标题残片不能当"原文"展示：短且以冒号结尾的多半是章节名
+    // （实测"合同标的及项目范围："被复用支撑 3 条不同结论）。此时回退规则侧
+    // 证据原文，宁可展示规则证据也不展示与结论无关的标题行。
+    // 关键字规则再加一道一致性校验：这类规则的结论就落在"关键词在不在"上，
+    // 模型却常拿一句话题相近、但不含该关键词的条款来凑原文（实测"源程序"
+    // 引的是"系统升级性服务"条款）——引文里连关键词都没有，它就证明不了
+    // 这条规则的结论，此时同样退回规则侧证据。关键字规则的 title 即检索词
+    // （v0.14 的 5 条：源代码 / 源程序 / 源码 / 代码 / 程序），故直接拿 title 比对。
+    const keywordTerm = String(rule?.title || "").trim();
+    const keywordQuoteMiss =
+      rule?.check_method === "keyword" && keywordTerm && !aiQuote.includes(keywordTerm);
+    const aiQuoteUsable =
+      aiQuote && !(aiQuote.length <= 20 && /[:：]\s*$/.test(aiQuote)) && !keywordQuoteMiss;
     return {
       ...base,
       // AI 判定的等级与理由优先，规则身份/分类/条文位置保留规则侧
@@ -511,17 +552,26 @@ function reviewItems(resp) {
       // 只喂 risk_level：base 里继承来的旧 verdict 会让 itemVerdict 直接短路
       verdict: itemVerdict({ risk_level: level }),
       reason: ai.reason || base.reason,
-      quote: ai.quote || base.quote,
+      quote: aiQuoteUsable ? aiQuote : base.quote,
+      suggested_action: suggestion || null,
       confidence: ai.confidence != null ? ai.confidence : base.confidence,
       ai_risk_level: ai.risk_level || null,
       ai_reason: ai.reason || null,
+      ai_recommended_action: ai.recommended_action || null,
     };
   });
 
   // 规则清单之外的风险点，以及未能对上任何规则的 AI 条目
-  const extras = [];
-  pending.forEach((hits) => extras.push(...hits));
-  return sortBySeverity([...merged, ...extras]);
+  const aiExtras = [];
+  pending.forEach((hits) => aiExtras.push(...hits));
+  const items = sortBySeverity([...merged, ...aiExtras]);
+  // 规则判定（57 条，每次审查固定）与 AI 规则外补充（条数随模型通读波动）
+  // 分开计数：摘要卡上"规则项"才不会因补充条数跳动。
+  return { ruleItems: merged, aiExtras, items };
+}
+
+function reviewItems(resp) {
+  return reviewItemsSplit(resp).items;
 }
 
 function sortBySeverity(items) {
@@ -918,6 +968,9 @@ function renderReviewResult(resp) {
 
 /** 把审查结果渲染进指定容器（主页面 / 任务结果模态框共用） */
 function renderReviewViews(wrap, resp) {
+  // 先清空容器：调用方可能刚渲染过"审查中…"进度卡（如拟定页审查流），
+  // 结果出来后进度卡必须消失，而不是叠在结果上方。
+  wrap.innerHTML = "";
   const rr = resp?.review_result;
   if (!rr) {
     wrap.appendChild(el("div", { class: "card" }, [
@@ -943,10 +996,15 @@ function renderReviewViews(wrap, resp) {
   const fm = FINDING_META[overall] || FINDING_META.UNKNOWN;
 
   // 单一核心清单：所有展示项都由 ReviewResult.findings 派生而来。
-  const items = reviewItems(resp);
+  const split = reviewItemsSplit(resp);
+  const items = split.items;
   const blocked = items.some((it) => itemVerdict(it) === "不符");
-  const verdictCounts = { 符合: 0, 不符: 0, 待确认: 0 };
-  items.forEach((item) => { verdictCounts[itemVerdict(item)] += 1; });
+  // 规则项只统计规则判定（固定 57 条），AI 规则外补充单列——
+  // 补充条数随模型通读波动，混在一起会让"规则项"数字看起来不稳定。
+  const ruleVerdicts = { 符合: 0, 不符: 0, 待确认: 0 };
+  split.ruleItems.forEach((item) => { ruleVerdicts[itemVerdict(item)] += 1; });
+  const extraVerdicts = { 符合: 0, 不符: 0, 待确认: 0 };
+  split.aiExtras.forEach((item) => { extraVerdicts[itemVerdict(item)] += 1; });
 
   // 摘要
   const overallCls = fm.cls === "red" ? "red" : fm.cls === "yellow" ? "yellow" : fm.cls === "green" ? "green" : "gray";
@@ -960,7 +1018,8 @@ function renderReviewViews(wrap, resp) {
   lead.classList.add("stat-lead", overallCls);
   const summary = el("div", { class: "grid grid-4" }, [
     lead,
-    stat("规则项", String(items.length), "blue", el("span", { class: "lead-sub", text: `不符 ${verdictCounts["不符"]} · 待确认 ${verdictCounts["待确认"]} · 符合 ${verdictCounts["符合"]}` })),
+    stat("规则项", String(split.ruleItems.length), "blue", el("span", { class: "lead-sub", text: `不符 ${ruleVerdicts["不符"]} · 待确认 ${ruleVerdicts["待确认"]} · 符合 ${ruleVerdicts["符合"]}` })),
+    stat("AI 补充风险", String(split.aiExtras.length), split.aiExtras.length ? "orange" : "gray", el("span", { class: "lead-sub", text: split.aiExtras.length ? `规则库外 · 不符 ${extraVerdicts["不符"]} · 待确认 ${extraVerdicts["待确认"]}` : "本次通读未发现规则外风险" })),
     stat("需人工复核", blocked ? "是" : "否", blocked ? "orange" : "green"),
     stat("审查指纹", run.result_fingerprint ? shortId(run.result_fingerprint) : "-", "gray", el("span", { class: "muted", text: `规则 ${run.rule_version || "-"} · 模型 ${run.model_version || "未启用"}` })),
   ]);
@@ -1050,6 +1109,20 @@ const reviewWorkspace = {
   controlVerdict: "不符",
 };
 
+/** 跨栏跳转的待展开落点（内控栏的 DOM id），只在一次渲染内有效。 */
+let pendingControlFocus = null;
+
+/** 跳转落点的视觉提示：滚动 + 短暂的背景高亮。 */
+function revealControlNode(id) {
+  const node = document.getElementById(id);
+  if (!node) return false;
+  // 内控清单在页面下半部，只切栏不滚动，用户仍看不到落点。
+  node.scrollIntoView({ block: "center", behavior: "smooth" });
+  node.classList.add("ppt-acc-flash");
+  window.setTimeout(() => node.classList.remove("ppt-acc-flash"), 1800);
+  return true;
+}
+
 function buildReviewPanels(items, rr, run, report, evidence, documents, options = {}) {
   const grouped = {};
   REVIEW_PANELS.forEach(([name]) => { grouped[name] = []; });
@@ -1075,6 +1148,24 @@ function buildReviewPanels(items, rr, run, report, evidence, documents, options 
   };
 
   reviewWorkspace.showPanel = renderPanel;
+
+  /**
+   * 从合理性 / 风险点 / 资信跳到内控栏的对应规则。
+   * 内控栏按判定分三组、每组默认只展开第一条，所以只切面板不够：
+   * 必须同时指定分组并展开目标行，否则用户切过去面对的是一长串折叠列表，
+   * 等于没跳。
+   */
+  reviewWorkspace.openControl = (item) => {
+    if (!item) return;
+    const id = controlItemDomId(item);
+    pendingControlFocus = id;
+    reviewWorkspace.controlVerdict = itemVerdict(item);
+    renderPanel("内控");
+    pendingControlFocus = null;
+    if (revealControlNode(id)) return;
+    // 面板刚构建、还没进文档时查不到节点，下一帧再试一次。
+    window.requestAnimationFrame(() => revealControlNode(id));
+  };
 
   tabs.querySelectorAll(".tab").forEach((btn) => {
     btn.addEventListener("click", () => renderPanel(btn.getAttribute("data-panel")));
@@ -1147,6 +1238,11 @@ function controlAdvice(item) {
   return String(item.suggested_action || item.recommended_action || "").trim() || "暂无调整建议";
 }
 
+/** 判定理由：卡片的等级是谁判的、依据是什么，都在这句话里。 */
+function controlReason(item) {
+  return String(item.reason || "").trim();
+}
+
 /** 当前语境下的"重新审查"：拟定页弹窗用表单附件，审查页用页面附件。 */
 function rerunActiveReview() {
   if (currentPage === "draft" && typeof submitFillReview === "function" && elementsState.files.length) {
@@ -1157,18 +1253,28 @@ function rerunActiveReview() {
 }
 
 function buildControlBody(item) {
+  const reason = controlReason(item);
   return el("div", { class: "ppt-acc-body" }, [
     el("div", { class: "ppt-field" }, [
       el("div", { class: "ppt-field-label", text: "原文" }),
       el("div", { class: "ppt-quote", text: controlQuote(item) || "" }),
     ]),
+    // 理由必须上屏：原文常常是"话题最近的条款"而非直接命中句（例如判定
+    // 「是否有保函要求？」时引的是合同里的质保金条款），只给原文不给理由，
+    // 读起来就是原文与规则无关。理由为空时才省略这一栏。
+    reason
+      ? el("div", { class: "ppt-field" }, [
+        el("div", { class: "ppt-field-label", text: "理由" }),
+        el("div", { class: "ppt-reason", text: reason }),
+      ])
+      : null,
     el("div", { class: "ppt-field" }, [
       el("div", { class: "ppt-field-label", text: "建议" }),
       el("div", { class: "ppt-advice", text: controlAdvice(item) }),
     ]),
     el("div", { class: "ppt-control-actions" }, [
       el("button", { class: "ppt-btn primary", text: "插入调整", onclick: () => copyText(controlAdvice(item)) }),
-      el("button", { class: "ppt-btn", text: "插入评论", onclick: () => copyText(`【内控】${controlNavTitle(item)}\n原文：${controlQuote(item)}\n建议：${controlAdvice(item)}`) }),
+      el("button", { class: "ppt-btn", text: "插入评论", onclick: () => copyText(`【内控】${controlNavTitle(item)}\n原文：${controlQuote(item)}\n理由：${reason}\n建议：${controlAdvice(item)}`) }),
       el("button", { class: "ppt-btn", text: "重新审查", onclick: rerunActiveReview }),
     ]),
   ]);
@@ -1178,10 +1284,11 @@ function controlItems(items) {
   return items.filter((item) => !/^合同类型判定/.test(item.title || ""));
 }
 
-function buildControlRuleList(items) {
+function buildControlRuleList(items, focusId) {
   if (!items.length) return el("p", { class: "muted", text: "该分类暂无规则。" });
   const list = el("div", { class: "ppt-acc" });
   let opened = -1;
+  let focusIndex = -1;
   const rows = items.map((item, index) => {
     const verdict = itemVerdict(item);
     const vm = VERDICT_META[verdict] || VERDICT_META["待确认"];
@@ -1197,10 +1304,13 @@ function buildControlRuleList(items) {
       el("span", { text: `${index + 1}. ${controlNavTitle(item)}` }),
     ]);
     const row = el("div", { class: `ppt-acc-item verdict-${vm.cls}`, id: controlItemDomId(item) }, [head, buildControlBody(item)]);
+    if (focusId && row.id === focusId) focusIndex = index;
     return row;
   });
   rows.forEach((row) => list.appendChild(row));
-  if (rows[0]) rows[0].classList.add("open");
+  // 有跳转落点就展开它，没有才维持"默认展开第一条"的原行为。
+  opened = focusIndex === -1 ? (rows.length ? 0 : -1) : focusIndex;
+  if (rows[opened]) rows[opened].classList.add("open");
   return list;
 }
 
@@ -1232,7 +1342,10 @@ function buildControlPanel(items) {
       btn.classList.toggle("active", btn.getAttribute("data-verdict") === current);
     });
     listHost.innerHTML = "";
-    listHost.appendChild(buildControlRuleList(grouped[current] || []));
+    // 落点只消费一次：用户之后自己点分组时不该再被强行拉回上次的位置。
+    const focusId = pendingControlFocus;
+    pendingControlFocus = null;
+    listHost.appendChild(buildControlRuleList(grouped[current] || [], focusId));
   };
 
   tabs.querySelectorAll(".tab").forEach((btn) => {
@@ -1279,13 +1392,37 @@ function isRiskPointItem(item) {
   return RISK_POINT_KEYS.includes(metricKey(item)) || extraRiskItems([item]).length > 0;
 }
 
+/** 标题规范化：只留判断用的字面，去序号前缀、去尾部问号冒号、去空白。 */
+function normalizeTitleKey(text) {
+  return String(text || "")
+    .replace(/^合同类型判定[:：]\s*/, "")
+    .replace(/^(?:第?\d+(?:\.\d+)*[、.\s]*)+/, "")
+    .replace(/[\s\u3000]/g, "")
+    .replace(/[？?：:]\s*$/, "")
+    .trim();
+}
+
 function linkedControlItem(item, allItems) {
   if (!item) return null;
+  const pool = controlItems(allItems || []);
   const keys = new Set([item.rule_id, item.risk_id, controlNavTitle(item)].filter(Boolean));
-  return controlItems(allItems || []).find((candidate) => {
+  const direct = pool.find((candidate) => {
     const candidateKeys = [candidate.rule_id, candidate.risk_id, controlNavTitle(candidate)].filter(Boolean);
     return candidateKeys.some((key) => keys.has(key));
-  }) || (itemModule(item) === "内控" ? item : null);
+  });
+  if (direct) return direct;
+  // 规则库外的 AI 条目没有 rule_id，标题也常与规则侧差一个问号或序号前缀
+  // （规则里叫"是否有保函要求？"，AI 条目标题里叫"保函要求"）。规范化后
+  // 再对一次，让这些条目也能落到内控栏上，而不是点了没反应。
+  const target = normalizeTitleKey(item.title);
+  if (target) {
+    const byTitle = pool.find((candidate) => normalizeTitleKey(candidate.title) === target);
+    if (byTitle) return byTitle;
+  }
+  // 兜底只认"本来就在内控清单里的条目"。pickMetric 会给未命中的指标造占位对象
+  // （"合同未明确约定该项…"），它按 itemModule 会落到内控，但内控栏并没有这条，
+  // 给它挂链接只会跳到一个凭空拼出的 id 上——不滚动、不高亮，看起来像跳错了。
+  return pool.indexOf(item) >= 0 ? item : null;
 }
 
 function reasonablenessLine(item, title, allItems) {
@@ -2455,6 +2592,14 @@ async function loadAiRules() {
       guide: "确认启用后进入审查提示池；规则引擎按同一批规则分维度展示。",
       defaultTopic: "其他检查",
       hideCreate: true,
+      // 批量确认入口：候选池常积几十条，逐条点开关太慢（2026-09-20 加）。
+      headerAction: aiRules.length
+        ? el("button", {
+            class: "btn btn-primary btn-sm",
+            text: `全部启用（${aiRules.length}）`,
+            onclick: () => confirmAllAiRules(aiRules.length),
+          })
+        : null,
       // AI 规则池保留该列并改名：condition 即模型提炼该检查点的理由，
       // 是审批「是否确认启用」的依据，不能省。
       conditionColumn: "提炼依据",
@@ -2543,6 +2688,7 @@ function buildRulePack(pack) {
         el("span", { text: pack.title }),
         el("span", { class: "hint", text: pack.hint }),
         el("span", { class: "grow" }),
+        pack.headerAction || null,
         pack.hideCreate ? null : el("button", { class: "btn btn-primary btn-sm", text: "新增规则", onclick: () => openRuleForm({ topic: pack.defaultTopic }, pack.conditionColumn) }),
         el("button", { class: "btn btn-secondary btn-sm", text: "刷新", onclick: loadAiRules }),
       ]),
@@ -2798,6 +2944,17 @@ async function toggleRuleEnabled(rule, enabled) {
 async function confirmCandidate(rule) {
   // 候选规则不是普通启停状态，必须明确执行确认动作。
   await toggleRuleEnabled(rule, true);
+}
+
+async function confirmAllAiRules(count) {
+  if (!window.confirm(`确定把 ${count} 条 AI 候选规则全部转入「合同检查标准」？\n确认后立即生效，之后每次审查都按固定规则判定。`)) return;
+  try {
+    const resp = await api.post("/contract-review/rules/confirm-candidates", {});
+    toast(`已确认启用 ${resp?.count ?? count} 条 AI 规则，进入合同检查标准`, "ok");
+    await loadAiRules();
+  } catch (e) {
+    toast("批量启用失败：" + (e?.message || e), "err");
+  }
 }
 
 async function deleteRule(rule) {

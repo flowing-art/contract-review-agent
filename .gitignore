@@ -32,3 +32,10 @@ gcm-diagnose.log
 # 规则编辑覆盖层（本机运行期数据：custom_rules / disabled_ids / removed_ids / ai_candidates，不入库）
 data/contract_custom_rules.json
 data/contract_custom_rules.json.*
+
+# 本地 Dify 工作流，不推送到公开仓库
+dify/
+
+# 旧版本地运行库，不入库
+data/ai_rules.db
+data/element_fields.db

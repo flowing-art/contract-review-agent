@@ -345,6 +345,15 @@ def select_rules(
     ]
 
 
+# 适用性无法判定时的原因码。三类缺口的责任方不同：合同类型是审查入口的
+# 必填项；「规则库未声明」属规则维护项，用户无从补齐；「上下文未提供」
+# 依赖交易立场、适用法域等上传信息。执行器据此给出可操作的说明。
+APPLICABILITY_CAUSE_CONTRACT_TYPE_MISSING = "contract_type_missing"
+APPLICABILITY_CAUSE_RULE_NOT_CONFIGURED = "rule_not_configured"
+APPLICABILITY_CAUSE_CONTEXT_INCOMPLETE = "context_incomplete"
+APPLICABILITY_CAUSE_RESOLVED = "resolved"
+
+
 def resolve_rule_applicability(
     rule: Rule,
     *,
@@ -356,15 +365,48 @@ def resolve_rule_applicability(
     明确映射时返回 ``unknown``，由执行器生成可见复核项，而不是自动通过。
     """
 
+    return _resolve_applicability(rule, review_context=review_context)[0]
+
+
+def explain_rule_applicability(
+    rule: Rule,
+    *,
+    review_context: ReviewContext,
+) -> tuple[str, str]:
+    """解析适用性并给出原因码：``(适用性, 原因码)``。
+
+    原因码取值见 ``APPLICABILITY_CAUSE_*``。执行器用它在复核项里区分
+    "规则库没声明" 与 "上下文没提供"——两者的责任方与补救动作完全不同。
+    """
+
+    return _resolve_applicability(rule, review_context=review_context)
+
+
+def _resolve_applicability(
+    rule: Rule,
+    *,
+    review_context: ReviewContext,
+) -> tuple[str, str]:
+    """适用性解析的单一实现，返回 ``(结论, 原因码)``。"""
+
     effective_contract_type = review_context.contract_type
     if not effective_contract_type:
-        return "unknown"
+        return "unknown", APPLICABILITY_CAUSE_CONTRACT_TYPE_MISSING
     spec = _applicability_spec(rule, effective_contract_type)
-    if spec is not None:
-        return _resolve_structured_applicability(spec, review_context)
-    if _rule_applies_to(rule, effective_contract_type):
-        return "required"
-    return "unknown"
+    if spec is None:
+        if _rule_applies_to(rule, effective_contract_type):
+            return "required", APPLICABILITY_CAUSE_RESOLVED
+        # 既没有该类型下的适用性声明，applies_to 也不覆盖：规则库声明缺口。
+        return "unknown", APPLICABILITY_CAUSE_RULE_NOT_CONFIGURED
+    result = _resolve_structured_applicability(spec, review_context)
+    if result == "unspecified":
+        # 声明存在但写的是 unspecified：规则库没给出该类型下的结论。
+        return result, APPLICABILITY_CAUSE_RULE_NOT_CONFIGURED
+    if result == "unknown":
+        # ``ApplicabilitySpec.applicability`` 没有 "unknown" 取值，走到这里
+        # 只可能是条件评估时输入事实不足（立场/法域/金额/文档角色未提供）。
+        return result, APPLICABILITY_CAUSE_CONTEXT_INCOMPLETE
+    return result, APPLICABILITY_CAUSE_RESOLVED
 
 
 def rule_document_kinds(

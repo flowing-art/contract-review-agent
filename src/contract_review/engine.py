@@ -33,12 +33,35 @@ from .models import (
 from .playbook import evaluate_playbook_rule
 from .rule_checkers import RuleCheckContext, execute_configured_rule_checker
 from .rules import (
+    APPLICABILITY_CAUSE_CONTRACT_TYPE_MISSING,
+    APPLICABILITY_CAUSE_CONTEXT_INCOMPLETE,
+    APPLICABILITY_CAUSE_RULE_NOT_CONFIGURED,
     assert_rule_bundle_compatible,
+    explain_rule_applicability,
     resolve_rule_applicability,
     select_rules,
 )
 
-ENGINE_VERSION = "rule-engine-0.4.0"
+ENGINE_VERSION = "rule-engine-0.4.1"
+
+# 适用性无法判定时的用户说明，按原因码分治（见 rules.APPLICABILITY_CAUSE_*）。
+# 「规则库未声明」是规则维护项，用户补不了；「上下文未提供」可由上传信息补齐。
+# 两类混用同一句会把用户指向唯一已经具备的事实（合同类型），真正的缺口
+# （交易立场、适用法域）反而没被提及。
+_APPLICABILITY_GAP_MESSAGES: dict[str, tuple[str, str]] = {
+    APPLICABILITY_CAUSE_CONTRACT_TYPE_MISSING: (
+        "未声明合同类型，无法判定本规则是否适用。",
+        "指定合同类型后重新审查。",
+    ),
+    APPLICABILITY_CAUSE_RULE_NOT_CONFIGURED: (
+        "规则库未声明本规则在当前合同类型下的适用性，无法自动判定。",
+        "该规则的适用性配置缺失（属规则维护项）；当前请先人工核对该条款。",
+    ),
+    APPLICABILITY_CAUSE_CONTEXT_INCOMPLETE: (
+        "判定本规则是否适用需要交易立场、适用法域等信息，本次审查未提供。",
+        "补充本方交易立场与适用法域后重新审查。",
+    ),
+}
 
 
 class RuleExecutionResult(ModelBase):
@@ -236,7 +259,7 @@ def execute_rule_bundle(
             for reference in attachment_references
             if rule_candidate_ids.intersection(reference.candidate_ids)
         )
-        applicability = resolve_rule_applicability(
+        applicability, applicability_cause = explain_rule_applicability(
             rule,
             review_context=effective_context,
         )
@@ -254,13 +277,17 @@ def execute_rule_bundle(
             continue
 
         if applicability in {"unknown", "unspecified"}:
+            gap_reason, gap_action = _APPLICABILITY_GAP_MESSAGES.get(
+                applicability_cause,
+                _APPLICABILITY_GAP_MESSAGES[APPLICABILITY_CAUSE_RULE_NOT_CONFIGURED],
+            )
             findings.append(
                 _finding(
                     rule,
                     status=FindingStatus.UNKNOWN,
-                    reason="当前合同类型未能从来源规则中确定本规则的适用性。",
+                    reason=gap_reason,
                     evidence_ids=[rule_evidence.evidence_id, package_evidence.evidence_id],
-                    recommended_action="补充合同类型事实及其原文证据，或由审核人配置规则适用性。",
+                    recommended_action=gap_action,
                     confidence=0.0,
                 )
             )

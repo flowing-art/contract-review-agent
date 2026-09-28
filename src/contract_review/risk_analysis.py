@@ -6,6 +6,8 @@
 1. **证据门禁**：BLOCK/WARN/INFO 风险项必须回指候选证据白名单内的
    ``evidence_id``，模型不能凭常识编风险；规则判定项中"符合"（PASS）允许
    无证据引用——判定本身的依据写在 reason 里，由审计核对证据存在性。
+   规则外补充项进一步只允许 BLOCK/WARN，并在同一证据上合并相似表述，
+   避免同一条款既进"不符"又进"待确认"。
 2. **覆盖率在提示词里恢复（v1 口径）**：模型必须对规则清单里的每一条规则
    输出判定（PASS/BLOCK/WARN/UNKNOWN），再补充规则外风险——这样审查清单
    才会展示全部规则（v1 的覆盖率硬校验由"提示词强制 + 门禁归一"承接）。
@@ -34,10 +36,12 @@ from .models import (
 )
 
 
-RISK_ANALYSIS_VERSION = "contract-risk-analysis-0.3.0"
+RISK_ANALYSIS_VERSION = "contract-risk-analysis-0.3.4"
 MAX_RISK_ANALYSIS_CANDIDATES = 32
 MAX_RISK_ITEM_TITLE_LENGTH = 80
 MAX_RISK_ITEM_REASON_LENGTH = 600
+# 建议动作：模型给的可执行修订建议，展示在界面的"建议"栏。
+MAX_RISK_ITEM_ACTION_LENGTH = 200
 MAX_RISK_QUOTE_LENGTH = 100
 # 防失控上限：每条适用规则一条判定 + 额外风险。
 MAX_RISK_ANALYSIS_ITEMS = 200
@@ -55,6 +59,24 @@ RISK_ITEM_LEVELS = frozenset(
 )
 # 允许不带证据的等级：这三个等级都不构成"发现问题"，不要求回指摘录。
 LEVELS_WITHOUT_EVIDENCE = frozenset({"PASS", "NOT_APPLICABLE", "UNKNOWN"})
+# 规则外补充项（不带 rule_id）只允许"确实发现问题"的两个等级：提示级
+# （INFO）在清单里没有落点——“对某一方不利”这类实质问题必须给 WARN/BLOCK，
+# 而 PASS/UNKNOWN/NOT_APPLICABLE 说明模型自己都没得出补充结论，不该占位。
+SUPPLEMENT_LEVELS = frozenset({"BLOCK", "WARN"})
+# 等级严重度排序：同一条款被模型拆成多条时按此取高者。
+LEVEL_SEVERITY = {
+    "NOT_APPLICABLE": 0,
+    "PASS": 1,
+    "UNKNOWN": 2,
+    "INFO": 3,
+    "WARN": 4,
+    "BLOCK": 5,
+}
+# 同一证据上标题相似度达到该阈值即视为同一问题的重复表述，合并保留高等级。
+# 实测：同一管辖条款被写成"争议管辖约定对乙方不利/偏向甲方/甲方所在地"3 条，
+# 两两相似度 0.36~0.5。阈值取 0.35（同证据 + 相近措辞），不同主题的同证据
+# 条目相似度实测 <0.1（如"管辖"vs"付款"=0.06），不会被误合并。
+TITLE_SIMILARITY_THRESHOLD = 0.35
 # 合同类型分类规则的分类名：5 个候选类型是单选题，不是 5 道判断题。
 CONTRACT_TYPE_CATEGORY = "合同类型"
 RISK_ANALYSIS_SYSTEM_INSTRUCTION = (
@@ -71,15 +93,38 @@ RISK_ANALYSIS_SYSTEM_INSTRUCTION = (
     "reason 说明判定依据与影响。\n"
     "2. 合同类型是单选题：第 1 步选定的那个类型判 PASS，其余候选类型一律判 "
     "NOT_APPLICABLE（不适用）——不要给未选中的候选类型判 WARN 或 UNKNOWN。\n"
+    "2.1 金额口径类规则（不含税/税额/税率/金额大小写等）按“可推算即确定”判断："
+    "合同只要明确“含税价 + 税率”（或不含税价 + 税率），不含税金额、税额都能唯一"
+    "推算、口径无歧义，就判 PASS（符合）；明确“不含税价”的同样判 PASS。"
+    "不要因为合同没有单独列示不含税金额、税额就判 WARN——那是同一口径的换算结果，"
+    "不是缺失。只有金额口径互相矛盾（如同时出现两个不一致的口径）、或完全无法判断"
+    "是否含税时，才判 WARN / UNKNOWN。\n"
     "3. risk_level 为 BLOCK/WARN/INFO 的条目必须给出 evidence_id（该结论在"
     "合同摘录中的出处）；PASS / NOT_APPLICABLE 条目可省略 evidence_id；"
     "UNKNOWN 建议给出支撑摘录。规则判定项的 reason 控制在 60 字以内，额外"
     "风险的 reason 不超过 200 字——输出必须完整，不要省略任何规则的判定。\n"
+    "3.1 判定为 BLOCK 或 WARN 的条目必须给出 recommended_action（一句话可执行"
+    "建议，如“改为被告所在地法院管辖”）；PASS / NOT_APPLICABLE 可省略。\n"
     "4. 规则判定之外，发现规则清单没有覆盖的风险点时，额外输出条目：不带"
     "rule_id，module 按问题性质从 风险点/合理性/内控/资信 中选择，且必须有"
-    "evidence_id。\n"
+    "evidence_id；**补充条目的 risk_level 只能是 BLOCK 或 WARN**——判断为"
+    "对某一方不利、约定不完整、口径不清等实质问题就给 WARN（重大失衡给 "
+    "BLOCK）；只是背景说明、不构成风险的信息不要输出，不要用 INFO 占位。\n"
+    "4.1 同一处条款、同一个问题只输出一条：不要为同一条款换措辞重复列"
+    "（例如既写“管辖约定对乙方不利”又写“管辖偏向甲方”），重复条目会被合并。\n"
     "5. evidence_id 只能从 allowed_evidence_ids 中逐字选择，禁止编造；"
     "quote 尽量摘录原文短句（不超过 100 字）。\n"
+    "5.1 引用的证据必须能直接支撑结论：**不要引用标题行、章节名、目录行、"
+    "封面或落款等残片**（例如“合同标的及项目范围：”这类只有标题没有内容的行）；"
+    "同一条证据不要反复用来支撑多条不同结论。若结论是“未见 / 未约定 / 缺失”，"
+    "应引用合同中提及该事项的正文句（例如“项目实施具体内容参见合同附件《…》”），"
+    "并在 reason 里说明是依据全文未见；确实没有任何相关句子时才允许不给证据。\n"
+    "5.2 quote 必须逐字取自 evidence_id 对应摘录中**支撑该条结论的那一句**。"
+    "结论主张“某项没有约定 / 缺失”时，话题相近但不能直接证明该结论的条款不要拿来"
+    "当 quote（判断“源程序”时引用“系统升级性服务”条款即属此类），此时 quote 留空"
+    "字符串，缺什么写进 reason；判断关键字类规则时，quote 必须包含该规则要检索的"
+    "关键字。各规则各自引用各自的证据，不要借同批次其他规则的候选条款充当本规则的"
+    "原文。\n"
     "6. 与 known_findings 中已列出的问题重复的不要重复输出（每条规则的判定"
     "项除外——那是必须输出的）。\n"
     "7. confidence 是你对该判断的把握程度，必须小于 1。\n"
@@ -87,7 +132,8 @@ RISK_ANALYSIS_SYSTEM_INSTRUCTION = (
     "引用摘录中的原句片段。\n"
     '只输出 JSON：{"contract_type":{"name":"...","basis":"..."},'
     '"items":[{"rule_id":"...","title":"...","risk_level":"PASS","reason":"...",'
-    '"evidence_id":"...","quote":"...","module":"内控","confidence":0.8}]}'
+    '"evidence_id":"...","quote":"...","module":"内控",'
+    '"recommended_action":"...","confidence":0.8}]}'
 )
 CONTRACT_TYPE_OPTIONS = (
     "软件产品销售",
@@ -316,33 +362,121 @@ def validate_risk_analysis_response(
         if not title:
             continue
         module = item.module if item.module in valid_modules else "内控"
+        # 规则身份：模型回填的 rule_id 不在本次适用规则清单里时视为
+        # 笔误；回填缺失时按标题逐字对账补回（模型经常只回填标题，
+        # 缺了 ID 就拿不到规则分类与检查方式，只能当规则外风险）。
+        resolved_rule_id = _resolve_rule_id(
+            item.rule_id,
+            title,
+            known_rule_ids,
+            rule_ids_by_title,
+        )
+        # 规则外补充项必须给出明确的风险等级：INFO/UNKNOWN 这类"看不太准"
+        # 的补充结论进清单只会落到"待确认"，把可判定问题说成不确定。
+        if resolved_rule_id is None and level not in SUPPLEMENT_LEVELS:
+            continue
         items.append(
             item.model_copy(
                 update={
                     "title": title[:MAX_RISK_ITEM_TITLE_LENGTH],
                     "risk_level": level,
                     "reason": item.reason.strip()[:MAX_RISK_ITEM_REASON_LENGTH],
+                    "recommended_action": item.recommended_action.strip()[
+                        :MAX_RISK_ITEM_ACTION_LENGTH
+                    ],
                     "quote": item.quote.strip()[:MAX_RISK_QUOTE_LENGTH],
                     "evidence_ids": evidence_ids,
                     "module": module,
-                    # 规则身份：模型回填的 rule_id 不在本次适用规则清单里时视为
-                    # 笔误；回填缺失时按标题逐字对账补回（模型经常只回填标题，
-                    # 缺了 ID 就拿不到规则分类与检查方式，只能当规则外风险）。
-                    "rule_id": _resolve_rule_id(
-                        item.rule_id,
-                        title,
-                        known_rule_ids,
-                        rule_ids_by_title,
-                    ),
+                    "rule_id": resolved_rule_id,
                     "confidence": min(max(item.confidence, 0.01), 0.99),
                 }
             )
         )
     return _apply_contract_type_single_choice(
-        items,
+        _dedupe_risk_items(items),
         response.contract_type,
         category_by_rule_id,
     )
+
+
+def _title_bigrams(value: str) -> set[str]:
+    """标题的二元字组集合（去掉标点与空白），用于衡量两条是否在说同一件事。"""
+
+    cleaned = re.sub(r"[\s，。、；：（）()「」【】“”\"'·—\-/]+", "", value)
+    if len(cleaned) < 2:
+        return {cleaned} if cleaned else set()
+    return {cleaned[index : index + 2] for index in range(len(cleaned) - 1)}
+
+
+def _title_similarity(left: str, right: str) -> float:
+    """二元字组 Jaccard 相似度；任一为空返回 0（不做无依据的合并）。"""
+
+    left_grams = _title_bigrams(left)
+    right_grams = _title_bigrams(right)
+    if not left_grams or not right_grams:
+        return 0.0
+    return len(left_grams & right_grams) / len(left_grams | right_grams)
+
+
+def _merge_risk_items(
+    current: RiskAnalysisItem, incoming: RiskAnalysisItem
+) -> RiskAnalysisItem:
+    """同一问题的两条表述合并：取更高等级，理由拼接（不丢另一条的信息）。"""
+
+    winner, loser = (
+        (incoming, current)
+        if LEVEL_SEVERITY[incoming.risk_level] > LEVEL_SEVERITY[current.risk_level]
+        else (current, incoming)
+    )
+    reason = winner.reason
+    if loser.reason and loser.reason not in reason:
+        reason = f"{reason}；{loser.reason}" if reason else loser.reason
+    return winner.model_copy(
+        update={
+            "evidence_ids": list(
+                dict.fromkeys([*current.evidence_ids, *incoming.evidence_ids])
+            ),
+            "reason": reason[:MAX_RISK_ITEM_REASON_LENGTH],
+            "recommended_action": winner.recommended_action or loser.recommended_action
+            or "",
+            "quote": winner.quote or loser.quote,
+            "confidence": max(current.confidence, incoming.confidence),
+        }
+    )
+
+
+def _dedupe_risk_items(items: Sequence[RiskAnalysisItem]) -> list[RiskAnalysisItem]:
+    """合并重复项：同一规则只留一条判定，同一证据上的相似补充项合并为一条。
+
+    模型经常把同一处条款写成多条（换措辞、换 module），不做合并时同一条款会
+    同时出现在"不符"与"待确认"两个分栏里，看起来像结论自相矛盾。
+    """
+
+    kept: list[RiskAnalysisItem] = []
+    index_by_rule_id: dict[str, int] = {}
+    for item in items:
+        if item.rule_id:
+            existing_index = index_by_rule_id.get(item.rule_id)
+            if existing_index is None:
+                index_by_rule_id[item.rule_id] = len(kept)
+                kept.append(item)
+                continue
+            kept[existing_index] = _merge_risk_items(kept[existing_index], item)
+            continue
+        merged = False
+        for index, existing in enumerate(kept):
+            if existing.rule_id:
+                continue
+            if not set(existing.evidence_ids) & set(item.evidence_ids):
+                continue
+            if _title_similarity(existing.title, item.title) < TITLE_SIMILARITY_THRESHOLD:
+                continue
+            kept[index] = _merge_risk_items(existing, item)
+            merged = True
+            break
+        if not merged:
+            kept.append(item)
+    return kept
 
 
 def _rule_ids_by_title(

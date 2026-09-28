@@ -521,6 +521,14 @@ def _build_item(raw: object) -> RiskAnalysisItem:
         raise TypeError("risk analysis item confidence must be numeric")
     bounded = min(max(float(confidence), 0.01), 0.99)
     quote = raw.get("quote", "")
+    # 建议动作：模型可能写 recommended_action / action / suggestion / 建议 之一。
+    action_raw = (
+        raw.get("recommended_action")
+        or raw.get("action")
+        or raw.get("suggestion")
+        or raw.get("建议")
+        or ""
+    )
     return RiskAnalysisItem(
         item_id=f"risk-{uuid.uuid4().hex[:12]}",
         title=title.strip(),
@@ -530,5 +538,6 @@ def _build_item(raw: object) -> RiskAnalysisItem:
         evidence_ids=[evidence_id.strip()] if isinstance(evidence_id, str) and evidence_id.strip() else [],
         module=str(raw.get("module", "内控")).strip() or "内控",
         rule_id=(str(raw["rule_id"]).strip() if raw.get("rule_id") else None),
+        recommended_action=str(action_raw).strip(),
         confidence=bounded,
     )

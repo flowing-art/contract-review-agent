@@ -440,6 +440,9 @@ table.table { width: 100%; border-collapse: collapse; font-size: 13px; }
   min-height: 88px; border: 1px solid #d1d5db; border-radius: 2px; padding: 12px 14px;
   color: #374151; line-height: 1.7; background: #fff; white-space: pre-wrap;
 }
+/* 判定理由：解释这条为什么落在当前等级。原文与建议是要复制出去的内容，走方框；
+   理由只是解释，用无框浅色文字，免得一张卡片三个方框显得很重。 */
+.ppt-reason { padding: 12px 2px 0; color: #4b5563; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
 .ppt-control-actions { display: flex; gap: 10px; margin-left: 58px; }
 .ppt-control-groups { display: flex; flex-direction: column; gap: 12px; }
 .ppt-control-tabs { margin-bottom: 8px; }
@@ -452,6 +455,13 @@ table.table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .ppt-tabs .tab.verdict-tab.green.active { color: #15803d; border-bottom-color: #16a34a; }
 .ppt-reason-link, .ppt-metric-link { cursor: pointer; }
 .ppt-reason-link:hover b, .ppt-metric-link:hover { color: #2563eb; }
+/* 从合理性 / 风险点跳过来的落点：展开之外还要给出视觉落点，
+   否则用户切到内控栏面对的是一长串列表，不确定跳到了哪一条。 */
+@keyframes pptAccFlash {
+  0% { background-color: #dbeafe; }
+  100% { background-color: transparent; }
+}
+.ppt-acc-item.ppt-acc-flash { animation: pptAccFlash 1.8s ease-out; }
 .ppt-link-hint { display: block; margin-top: 6px; color: #2563eb; font-size: 12px; }
 .ppt-btn {
   border: 1px solid #d1d5db; background: #fff; color: #374151; border-radius: 4px;

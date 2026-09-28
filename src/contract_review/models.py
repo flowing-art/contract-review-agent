@@ -758,6 +758,11 @@ class RiskAnalysisItem(ModelBase):
     evidence_ids: list[str] = Field(default_factory=list)
     module: str = "内控"
     rule_id: str | None = None
+    # 建议动作：模型判定为违反/风险时给出的可执行修订建议。基线（确定性）阶段
+    # 这类规则的 finding 是占位 UNKNOWN，其 recommended_action 是"缺少信息"口径
+    # 的通用文案；AI 判定覆盖后必须用模型自己的建议，否则界面会出现
+    # "理由说 A、建议说 B"的自相矛盾。
+    recommended_action: str = ""
     confidence: float = Field(ge=0, le=1)
 
 

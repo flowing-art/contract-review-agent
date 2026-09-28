@@ -143,7 +143,7 @@ def build_element_location_terms(catalog) -> list[str]:
     return list(dict.fromkeys(term.strip() for term in terms if term.strip()))
 
 
-PIPELINE_VERSION = "review-pipeline-0.12.2"
+PIPELINE_VERSION = "review-pipeline-0.12.3"
 REPORT_VERSION = "review-report-0.3.0"
 SEMANTIC_REVIEW_FALLBACK_CONFIGURATION_KEY = "semantic_review_fallback"
 SEMANTIC_RULE_CONCURRENCY_HARD_LIMIT = 3
